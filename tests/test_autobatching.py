@@ -448,10 +448,20 @@ def test_in_flight_auto_batcher_restore_order(
     #     batcher.restore_original_order([si_sim_state])
 
 
+@pytest.mark.parametrize(
+    "num_steps_per_batch",
+    [
+        5,  # At 5 steps, not every state will converge before the next batch.
+        #       This tests the merging of partially converged states with new states
+        #       which has been a bug in the past. See https://github.com/Radical-AI/torch-sim/pull/219
+        10,  # At 10 steps, all states will converge before the next batch
+    ],
+)
 def test_in_flight_with_fire(
     si_sim_state: ts.SimState,
     fe_supercell_sim_state: ts.SimState,
     lj_model: LennardJonesModel,
+    num_steps_per_batch: int,
 ) -> None:
     fire_init, fire_update = unit_cell_fire(lj_model)
 
@@ -489,8 +499,7 @@ def test_in_flight_with_fire(
         if state is None:
             break
 
-        # run 10 steps, arbitrary number
-        for _ in range(5):
+        for _ in range(num_steps_per_batch):
             state = fire_update(state)
         convergence_tensor = convergence_fn(state)
 
