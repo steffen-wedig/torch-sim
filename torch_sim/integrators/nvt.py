@@ -16,13 +16,14 @@ from torch_sim.integrators.md import (
     position_step,
     velocity_verlet,
 )
+from torch_sim.models.interface import ModelInterface
 from torch_sim.quantities import calc_kinetic_energy
 from torch_sim.state import SimState
 from torch_sim.typing import StateDict
 
 
 def nvt_langevin(  # noqa: C901
-    model: torch.nn.Module,
+    model: ModelInterface,
     *,
     dt: torch.Tensor,
     kT: torch.Tensor,
@@ -275,7 +276,7 @@ class NVTNoseHooverState(MDState):
 
 def nvt_nose_hoover(
     *,
-    model: torch.nn.Module,
+    model: ModelInterface,
     dt: torch.Tensor,
     kT: torch.Tensor,
     chain_length: int = 3,
@@ -367,7 +368,9 @@ def nvt_nose_hoover(
         )
 
         # Calculate initial kinetic energy per system
-        KE = calc_kinetic_energy(momenta, state.masses, system_idx=state.system_idx)
+        KE = calc_kinetic_energy(
+            masses=state.masses, momenta=momenta, system_idx=state.system_idx
+        )
 
         # Calculate degrees of freedom per system
         n_atoms_per_system = torch.bincount(state.system_idx)
@@ -433,7 +436,9 @@ def nvt_nose_hoover(
         state = velocity_verlet(state=state, dt=dt, model=model)
 
         # Update chain kinetic energy per system
-        KE = calc_kinetic_energy(state.momenta, state.masses, system_idx=state.system_idx)
+        KE = calc_kinetic_energy(
+            masses=state.masses, momenta=state.momenta, system_idx=state.system_idx
+        )
         chain.kinetic_energy = KE
 
         # Second half-step of chain evolution
@@ -477,7 +482,9 @@ def nvt_nose_hoover_invariant(
     """
     # Calculate system energy terms per system
     e_pot = state.energy
-    e_kin = calc_kinetic_energy(state.momenta, state.masses, system_idx=state.system_idx)
+    e_kin = calc_kinetic_energy(
+        masses=state.masses, momenta=state.momenta, system_idx=state.system_idx
+    )
 
     # Get system degrees of freedom per system
     n_atoms_per_system = torch.bincount(state.system_idx)

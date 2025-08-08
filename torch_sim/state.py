@@ -8,12 +8,12 @@ import copy
 import importlib
 import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 import torch
 
 import torch_sim as ts
-from torch_sim.typing import StateLike
+from torch_sim.typing import SimStateVar, StateLike
 
 
 if TYPE_CHECKING:
@@ -109,6 +109,7 @@ class SimState:
         self.pbc = pbc
         self.atomic_numbers = atomic_numbers
 
+        # Validate and process the state after initialization.
         # data validation and fill system_idx
         # should make pbc a tensor here
         # if devices aren't all the same, raise an error, in a clean way
@@ -136,13 +137,13 @@ class SimState:
                 self.n_atoms, device=self.device, dtype=torch.int64
             )
         else:
-            self.system_idx = system_idx
             # assert that system indices are unique consecutive integers
             # TODO(curtis): I feel like this logic is not reliable.
             # I'll come up with something better later.
-            _, counts = torch.unique_consecutive(self.system_idx, return_counts=True)
-            if not torch.all(counts == torch.bincount(self.system_idx)):
+            _, counts = torch.unique_consecutive(system_idx, return_counts=True)
+            if not torch.all(counts == torch.bincount(system_idx)):
                 raise ValueError("System indices must be unique consecutive integers")
+            self.system_idx = system_idx
 
         if self.cell.ndim != 3 and system_idx is None:
             self.cell = self.cell.unsqueeze(0)
@@ -251,7 +252,9 @@ class SimState:
     @property
     def volume(self) -> torch.Tensor:
         """Volume of the system."""
-        return torch.det(self.cell) if self.pbc else None
+        if not self.pbc:
+            raise ValueError("Volume is only defined for periodic systems")
+        return torch.det(self.cell)
 
     @property
     def column_vector_cell(self) -> torch.Tensor:
@@ -361,7 +364,7 @@ class SimState:
         for attr_name, attr_value in vars(modified_state).items():
             setattr(self, attr_name, attr_value)
 
-        return popped_states
+        return cast("list[Self]", popped_states)
 
     def to(
         self, device: torch.device | None = None, dtype: torch.dtype | None = None
@@ -401,14 +404,8 @@ class SimState:
 class DeformGradMixin:
     """Mixin for states that support deformation gradients."""
 
-    @property
-    def momenta(self) -> torch.Tensor:
-        """Calculate momenta from velocities and masses.
-
-        Returns:
-            The momenta of the particles
-        """
-        return self.velocities * self.masses.unsqueeze(-1)
+    reference_cell: torch.Tensor
+    row_vector_cell: torch.Tensor
 
     @property
     def reference_row_vector_cell(self) -> torch.Tensor:
@@ -483,10 +480,10 @@ def _normalize_system_indices(
 
 
 def state_to_device(
-    state: SimState,
+    state: SimStateVar,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
-) -> Self:
+) -> SimStateVar:
     """Convert the SimState to a new device and dtype.
 
     Creates a new SimState with all tensors moved to the specified device and
@@ -692,9 +689,9 @@ def _filter_attrs_by_mask(
 
 
 def _split_state(
-    state: SimState,
+    state: SimStateVar,
     ambiguous_handling: Literal["error", "globalize"] = "error",
-) -> list[SimState]:
+) -> list[SimStateVar]:
     """Split a SimState into a list of states, each containing a single system.
 
     Divides a multi-system state into individual single-system states, preserving
@@ -805,10 +802,10 @@ def _pop_states(
 
 
 def _slice_state(
-    state: SimState,
+    state: SimStateVar,
     system_indices: list[int] | torch.Tensor,
     ambiguous_handling: Literal["error", "globalize"] = "error",
-) -> SimState:
+) -> SimStateVar:
     """Slice a substate from the SimState containing only the specified system indices.
 
     Creates a new SimState containing only the specified systems, preserving
@@ -968,7 +965,7 @@ def initialize_state(
         return state_to_device(system, device, dtype)
 
     if isinstance(system, list) and all(isinstance(s, SimState) for s in system):
-        if not all(state.n_systems == 1 for state in system):
+        if not all(cast("SimState", state).n_systems == 1 for state in system):
             raise ValueError(
                 "When providing a list of states, to the initialize_state function, "
                 "all states must have n_systems == 1. To fix this, you can split the "

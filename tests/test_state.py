@@ -500,8 +500,8 @@ class DeformState(SimState, DeformGradMixin):
     def __init__(
         self,
         *args,
-        velocities: torch.Tensor | None = None,
-        reference_cell: torch.Tensor | None = None,
+        velocities: torch.Tensor,
+        reference_cell: torch.Tensor,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -528,14 +528,6 @@ def deform_grad_state(device: torch.device) -> DeformState:
         velocities=velocities,
         reference_cell=reference_cell,
     )
-
-
-def test_deform_grad_momenta(deform_grad_state: DeformState) -> None:
-    """Test momenta calculation in DeformGradMixin."""
-    expected_momenta = deform_grad_state.velocities * deform_grad_state.masses.unsqueeze(
-        -1
-    )
-    assert torch.allclose(deform_grad_state.momenta, expected_momenta)
 
 
 def test_deform_grad_reference_cell(deform_grad_state: DeformState) -> None:

@@ -14,6 +14,7 @@ from torch_sim.integrators.md import (
     calculate_momenta,
     construct_nose_hoover_chain,
 )
+from torch_sim.models.interface import ModelInterface
 from torch_sim.quantities import calc_kinetic_energy
 from torch_sim.state import SimState
 from torch_sim.typing import StateDict
@@ -140,7 +141,7 @@ def _compute_cell_force(
 
 
 def npt_langevin(  # noqa: C901, PLR0915
-    model: torch.nn.Module,
+    model: ModelInterface,
     *,
     dt: torch.Tensor,
     kT: torch.Tensor,
@@ -162,7 +163,7 @@ def npt_langevin(  # noqa: C901, PLR0915
     maintain constant temperature.
 
     Args:
-        model (torch.nn.Module): Neural network model that computes energies, forces,
+        model (ModelInterface): Neural network model that computes energies, forces,
             and stress. Must return a dict with 'energy', 'forces', and 'stress' keys.
         dt (torch.Tensor): Integration timestep, either scalar or shape [n_systems]
         kT (torch.Tensor): Target temperature in energy units, either scalar or
@@ -898,7 +899,7 @@ class NPTNoseHooverState(MDState):
 
 def npt_nose_hoover(  # noqa: C901, PLR0915
     *,
-    model: torch.nn.Module,
+    model: ModelInterface,
     kT: torch.Tensor,
     external_pressure: torch.Tensor,
     dt: torch.Tensor,
@@ -915,7 +916,7 @@ def npt_nose_hoover(  # noqa: C901, PLR0915
     with Nose-Hoover chain thermostats for temperature and pressure control.
 
     Args:
-        model (torch.nn.Module): Model to compute forces and energies
+        model (ModelInterface): Model to compute forces and energies
         kT (torch.Tensor): Target temperature in energy units
         external_pressure (torch.Tensor): Target external pressure
         dt (torch.Tensor): Integration timestep
@@ -1221,7 +1222,9 @@ def npt_nose_hoover(  # noqa: C901, PLR0915
             if system_mask.any():
                 system_momenta = momenta[system_mask]
                 system_masses = masses[system_mask]
-                KE_per_system[b] = calc_kinetic_energy(system_momenta, system_masses)
+                KE_per_system[b] = calc_kinetic_energy(
+                    masses=system_masses, momenta=system_momenta
+                )
 
         # Get stress tensor and compute trace per system
         # Handle stress tensor with batch dimension
@@ -1430,7 +1433,7 @@ def npt_nose_hoover(  # noqa: C901, PLR0915
         cell_mass = cell_mass.to(device=device, dtype=dtype)
 
         # Calculate cell kinetic energy (using first system for initialization)
-        KE_cell = calc_kinetic_energy(cell_momentum[:1], cell_mass[:1])
+        KE_cell = calc_kinetic_energy(masses=cell_mass[:1], momenta=cell_momentum[:1])
 
         # Ensure reference_cell has proper system dimensions
         if state.cell.ndim == 2:
@@ -1485,7 +1488,9 @@ def npt_nose_hoover(  # noqa: C901, PLR0915
         # Initialize thermostat
         npt_state.momenta = momenta
         KE = calc_kinetic_energy(
-            npt_state.momenta, npt_state.masses, system_idx=npt_state.system_idx
+            momenta=npt_state.momenta,
+            masses=npt_state.masses,
+            system_idx=npt_state.system_idx,
         )
         npt_state.thermostat = thermostat_fns.initialize(
             npt_state.positions.numel(), KE, kT
@@ -1542,10 +1547,12 @@ def npt_nose_hoover(  # noqa: C901, PLR0915
         )
 
         # Update kinetic energies for thermostats
-        KE = calc_kinetic_energy(state.momenta, state.masses, system_idx=state.system_idx)
+        KE = calc_kinetic_energy(
+            masses=state.masses, momenta=state.momenta, system_idx=state.system_idx
+        )
         state.thermostat.kinetic_energy = KE
 
-        KE_cell = calc_kinetic_energy(state.cell_momentum, state.cell_mass)
+        KE_cell = calc_kinetic_energy(masses=state.cell_mass, momenta=state.cell_momentum)
         state.barostat.kinetic_energy = KE_cell
 
         # Second half step of thermostat chains
@@ -1597,7 +1604,7 @@ def npt_nose_hoover_invariant(
 
     # Calculate kinetic energy of particles per system
     e_kin_per_system = calc_kinetic_energy(
-        state.momenta, state.masses, system_idx=state.system_idx
+        masses=state.masses, momenta=state.momenta, system_idx=state.system_idx
     )
 
     # Calculate degrees of freedom per system
