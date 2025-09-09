@@ -110,6 +110,7 @@ class MaceModel(ModelInterface):
         neighbor_list_fn: Callable = vesin_nl_ts,
         compute_forces: bool = True,
         compute_stress: bool = True,
+        compute_descriptors: bool = False,
         enable_cueq: bool = False,
         atomic_numbers: torch.Tensor | None = None,
         system_idx: torch.Tensor | None = None,
@@ -150,6 +151,7 @@ class MaceModel(ModelInterface):
         self._dtype = dtype
         self._compute_forces = compute_forces
         self._compute_stress = compute_stress
+        self._compute_descriptors = compute_descriptors
         self.neighbor_list_fn = neighbor_list_fn
         self._memory_scales_with = "n_atoms_x_density"
 
@@ -170,7 +172,7 @@ class MaceModel(ModelInterface):
 
         if enable_cueq:
             print("Converting models to CuEq for acceleration")  # noqa: T201
-            self.model = run_e3nn_to_cueq(self.model)
+            self.model = run_e3nn_to_cueq(self.model,device=self.device)
 
         # Set model properties
         self.r_max = self.model.r_max
@@ -366,6 +368,11 @@ class MaceModel(ModelInterface):
             stress = out["stress"]
             if stress is not None:
                 results["stress"] = stress.detach()
+
+        if self._compute_descriptors:
+            descriptors = out["node_feats"]
+            if descriptors is not None:
+                results["descriptors"] = descriptors.detach()
 
         return results
 
