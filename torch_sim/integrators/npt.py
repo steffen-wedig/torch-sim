@@ -478,7 +478,7 @@ def npt_langevin_anisotropic_init(
     cell_velocities = torch.zeros(state.n_systems, dim, device=device, dtype=dtype)
 
     batch_kT = kT.expand(state.n_systems) if kT.ndim == 0 else kT
-    n_atoms_per_system = torch.bincount(state.system_idx)
+    n_atoms_per_system = state.n_atoms_per_system
     cell_masses = (n_atoms_per_system + 1) * batch_kT * b_tau * b_tau
 
     if state.constraints:
@@ -588,7 +588,7 @@ def npt_langevin_anisotropic_step(
     batch_kT = kT_tensor.expand(state.n_systems) if kT_tensor.ndim == 0 else kT_tensor
 
     # Update barostat mass
-    n_atoms_per_system = torch.bincount(state.system_idx)
+    n_atoms_per_system = state.n_atoms_per_system
     state.cell_masses = (n_atoms_per_system + 1) * batch_kT * torch.square(state.b_tau)
 
     # Store initial values
@@ -954,7 +954,7 @@ def npt_langevin_isotropic_init(
     cell_velocities = torch.zeros(state.n_systems, device=device, dtype=dtype)
 
     batch_kT = kT.expand(state.n_systems) if kT.ndim == 0 else kT
-    n_atoms_per_system = torch.bincount(state.system_idx)
+    n_atoms_per_system = state.n_atoms_per_system
     cell_masses = (n_atoms_per_system + 1) * batch_kT * b_tau * b_tau
 
     if state.constraints:
@@ -1045,7 +1045,7 @@ def npt_langevin_isotropic_step(
     batch_kT = kT_tensor.expand(state.n_systems) if kT_tensor.ndim == 0 else kT_tensor
 
     # Update barostat mass
-    n_atoms_per_system = torch.bincount(state.system_idx)
+    n_atoms_per_system = state.n_atoms_per_system
     state.cell_masses = (n_atoms_per_system + 1) * batch_kT * torch.square(state.b_tau)
 
     # Store initial values
@@ -1299,7 +1299,7 @@ def _npt_nose_hoover_isotropic_update_cell_mass(
     kT_system = kT.expand(state.n_systems) if kT.ndim == 0 else kT
 
     # Calculate cell masses for each system
-    n_atoms_per_system = torch.bincount(state.system_idx, minlength=state.n_systems)
+    n_atoms_per_system = state.n_atoms_per_system
     cell_mass = (
         dim * (n_atoms_per_system + 1) * kT_system * torch.square(state.barostat.tau)
     )
@@ -1498,17 +1498,10 @@ def _npt_nose_hoover_isotropic_compute_cell_force(
     _N, dim = positions.shape
     n_systems = len(volume)
 
-    # Compute kinetic energy contribution per system
-    # Split momenta and masses by system
-    KE_per_system = torch.zeros(n_systems, device=positions.device, dtype=positions.dtype)
-    for sys_idx in range(n_systems):
-        system_mask = system_idx == sys_idx
-        if system_mask.any():
-            system_momenta = momenta[system_mask]
-            system_masses = masses[system_mask]
-            KE_per_system[sys_idx] = ts.calc_kinetic_energy(
-                masses=system_masses, momenta=system_momenta
-            )
+    # Kinetic energy per system, reduced on the device (no host-device sync)
+    KE_per_system = ts.calc_kinetic_energy(
+        masses=masses, momenta=momenta, system_idx=system_idx, n_systems=n_systems
+    )
 
     # Get stress tensor and compute trace per system
     # Handle stress tensor with batch dimension
@@ -1726,7 +1719,7 @@ def npt_nose_hoover_isotropic_init(
     kT_system = kT_tensor.expand(n_systems) if kT_tensor.ndim == 0 else kT_tensor
 
     # Calculate cell masses for each system
-    n_atoms_per_system = torch.bincount(state.system_idx, minlength=n_systems)
+    n_atoms_per_system = state.n_atoms_per_system
     cell_mass = dim * (n_atoms_per_system + 1) * kT_system * torch.square(b_tau_tensor)
     cell_mass = cell_mass.to(device=device, dtype=dtype)
 
@@ -1751,7 +1744,10 @@ def npt_nose_hoover_isotropic_init(
     dof_per_system = state.get_number_of_degrees_of_freedom() - 3
 
     KE_thermostat = ts.calc_kinetic_energy(
-        masses=state.masses, momenta=momenta, system_idx=state.system_idx
+        masses=state.masses,
+        momenta=momenta,
+        system_idx=state.system_idx,
+        n_systems=state.n_systems,
     )
 
     # Ensure reference_cell has proper system dimensions
@@ -1946,7 +1942,10 @@ def npt_nose_hoover_isotropic_step(
 
     # Update kinetic energies for thermostats
     KE = ts.calc_kinetic_energy(
-        masses=state.masses, momenta=state.momenta, system_idx=state.system_idx
+        masses=state.masses,
+        momenta=state.momenta,
+        system_idx=state.system_idx,
+        n_systems=state.n_systems,
     )
     state.thermostat.kinetic_energy = KE
 
@@ -2031,7 +2030,10 @@ def npt_nose_hoover_isotropic_invariant(
 
     # Calculate kinetic energy of particles per system
     e_kin_per_system = ts.calc_kinetic_energy(
-        masses=state.masses, momenta=state.momenta, system_idx=state.system_idx
+        masses=state.masses,
+        momenta=state.momenta,
+        system_idx=state.system_idx,
+        n_systems=state.n_systems,
     )
 
     # Calculate degrees of freedom per system
