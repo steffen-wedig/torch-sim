@@ -10,6 +10,7 @@ from torch_sim.autobatching import (
     _n_edges_scalers,
     calculate_memory_scalers,
     determine_max_batch_size,
+    estimate_max_memory_scaler,
     to_constant_volume_bins,
 )
 from torch_sim.models.lennard_jones import LennardJonesModel
@@ -92,6 +93,19 @@ def test_bounds_and_tuples():
     ]
 
 
+@pytest.mark.parametrize(
+    ("items", "lower_bound", "upper_bound"), [([1, 2], 11, 1), ([1, 2], 5, 5), ([], 5, 5)]
+)
+def test_to_constant_volume_bins_invalid_bounds(
+    items: list[int], lower_bound: int, upper_bound: int
+) -> None:
+    """Inverted or empty bounds raise instead of silently applying only lower_bound."""
+    with pytest.raises(ValueError, match="lower_bound is greater or equal"):
+        to_constant_volume_bins(
+            items, 5, lower_bound=lower_bound, upper_bound=upper_bound
+        )
+
+
 def test_calculate_scaling_metric(si_sim_state: ts.SimState) -> None:
     """Test calculation of scaling metrics for a state."""
     # Test n_atoms metric
@@ -100,7 +114,7 @@ def test_calculate_scaling_metric(si_sim_state: ts.SimState) -> None:
 
     # Test n_atoms_x_density metric
     density_metric = calculate_memory_scalers(si_sim_state, "n_atoms_x_density")
-    volume = torch.abs(torch.linalg.det(si_sim_state.cell[0])) / 1000
+    volume = ts.quantities.cell_volume(si_sim_state.cell[0]) / 1000
     expected = si_sim_state.n_atoms * (si_sim_state.n_atoms / volume.item())
     assert pytest.approx(density_metric[0], rel=1e-5) == expected
 
@@ -183,6 +197,51 @@ def test_n_edges_scalers_batched(ar_double_sim_state: ts.SimState) -> None:
     assert len(result) == ar_double_sim_state.n_systems
     assert all(isinstance(v, float) for v in result)
     assert all(v >= 0 for v in result)
+
+
+@pytest.fixture
+def mixed_many_sim_state(
+    ar_supercell_sim_state: ts.SimState, si_sim_state: ts.SimState
+) -> ts.SimState:
+    """Batched state of alternating large and small periodic systems."""
+    return ts.concatenate_states(
+        [ar_supercell_sim_state, si_sim_state, si_sim_state, ar_supercell_sim_state],
+        device=si_sim_state.device,
+    )
+
+
+@pytest.mark.parametrize("max_atoms_per_chunk", [1, 16, 40, 10_000])
+def test_n_edges_scalers_chunked_matches_single_pass(
+    mixed_many_sim_state: ts.SimState, max_atoms_per_chunk: int
+) -> None:
+    """Splitting the neighbor-list pass leaves every per-system edge count unchanged."""
+    state = mixed_many_sim_state
+    single = _n_edges_scalers(state, cutoff=5.0, max_atoms_per_chunk=state.n_atoms)
+    chunked = _n_edges_scalers(state, cutoff=5.0, max_atoms_per_chunk=max_atoms_per_chunk)
+    assert chunked == single
+
+
+@pytest.mark.parametrize("max_atoms_per_chunk", [1, 16, 40, 10_000])
+def test_n_edges_scalers_chunk_bounds(
+    mixed_many_sim_state: ts.SimState,
+    max_atoms_per_chunk: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each pass holds whole systems and exceeds the bound only for a lone system."""
+    passes: list[tuple[int, int]] = []
+    real_nl = ts.autobatching.torchsim_nl
+
+    def recording_nl(**kwargs: Any) -> Any:
+        passes.append((int(kwargs["system_idx"].max()) + 1, kwargs["positions"].shape[0]))
+        return real_nl(**kwargs)
+
+    monkeypatch.setattr(ts.autobatching, "torchsim_nl", recording_nl)
+    state = mixed_many_sim_state
+    _n_edges_scalers(state, cutoff=5.0, max_atoms_per_chunk=max_atoms_per_chunk)
+
+    assert sum(n_sys for n_sys, _ in passes) == state.n_systems
+    assert sum(n_at for _, n_at in passes) == state.n_atoms
+    assert all(n_at <= max_atoms_per_chunk or n_sys == 1 for n_sys, n_at in passes)
 
 
 @pytest.mark.parametrize("items", [[], {}])
@@ -516,19 +575,26 @@ def test_detach_state_graph_drops_grad_but_keeps_values(
 
 
 @pytest.mark.parametrize(
-    "oom_message",
+    "oom_error",
     [
-        "CUDA out of memory. Tried to allocate 20.00 MiB",
+        RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB"),
+        torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB"),
         # Warp / nvalchemiops allocator (used by ORB v3 neighbor lists) phrases
         # OOM differently and must still be recognised by the default matcher.
-        "Failed to allocate 2556 bytes on device 'cuda:0'",
+        RuntimeError("Failed to allocate 2556 bytes on device 'cuda:0'"),
+        # cuequivariance OOM error message.
+        RuntimeError(
+            "CUDA error encountered at: "
+            "call='cudaMallocAsync(&sort_permutation, ...)', "
+            "Reason=cudaErrorMemoryAllocation:out of memory"
+        ),
     ],
 )
 def test_determine_max_batch_size_recognises_oom_variants(
     si_sim_state: ts.SimState,
     lj_model: LennardJonesModel,
     monkeypatch: pytest.MonkeyPatch,
-    oom_message: str,
+    oom_error: RuntimeError,
 ) -> None:
     """OOM is detected for both PyTorch and Warp-style allocator messages.
 
@@ -541,7 +607,7 @@ def test_determine_max_batch_size_recognises_oom_variants(
     def mock_measure(*_args: Any, **_kwargs: Any) -> float:
         call_count["n"] += 1
         if call_count["n"] >= 3:  # OOM once the batch grows past a couple probes
-            raise RuntimeError(oom_message)
+            raise oom_error
         return 0.1
 
     monkeypatch.setattr(
@@ -1014,3 +1080,140 @@ def test_binning_auto_batcher_with_lbfgs(
         all_finished_states.extend(batch.split())
 
     assert len(all_finished_states) == len(lbfgs_states)
+
+
+@pytest.fixture
+def probed_n_atoms(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the number of atoms of each system whose batch size is probed."""
+    probed: list[int] = []
+
+    def recording_probe(state: ts.SimState, *_args: Any, **_kwargs: Any) -> int:
+        probed.append(state.n_atoms)
+        return 200
+
+    monkeypatch.setattr(ts.autobatching, "determine_max_batch_size", recording_probe)
+    return probed
+
+
+@pytest.mark.parametrize(("identical", "expected"), [(True, [8]), (False, [8, 256])])
+def test_estimate_max_memory_scaler_probes_the_smallest_and_largest_systems(
+    si_sim_state: ts.SimState,
+    fe_supercell_sim_state: ts.SimState,
+    lj_model: LennardJonesModel,
+    probed_n_atoms: list[int],
+    *,
+    identical: bool,
+    expected: list[int],
+) -> None:
+    """Identical systems are probed once, different ones the smallest and largest."""
+    second = si_sim_state if identical else fe_supercell_sim_state
+    states = ts.concatenate_states([si_sim_state, second])
+    metrics = calculate_memory_scalers(states, "n_atoms")
+
+    estimate_max_memory_scaler(states, lj_model, metrics)
+
+    assert probed_n_atoms == expected
+
+
+@pytest.mark.parametrize(
+    ("make_states", "expected"),
+    [
+        (list, [8, 256]),  # all the states are known: the smallest and the largest
+        (ts.concatenate_states, [8, 256]),
+        (iter, [8, 8, 256]),  # lazy: a bootstrap probe of the first state first
+    ],
+)
+def test_in_flight_auto_batcher_probes_known_states_without_bootstrap(
+    si_sim_state: ts.SimState,
+    fe_supercell_sim_state: ts.SimState,
+    lj_model: LennardJonesModel,
+    probed_n_atoms: list[int],
+    make_states: Any,
+    expected: list[int],
+) -> None:
+    batcher = InFlightAutoBatcher(model=lj_model, memory_scales_with="n_atoms")
+
+    batcher.load_states(make_states([si_sim_state, fe_supercell_sim_state]))
+
+    assert probed_n_atoms == expected
+
+
+@pytest.mark.parametrize(("identical", "expected"), [(True, [32]), (False, [32, 256])])
+def test_optimize_reuses_the_memory_estimate_of_the_init(
+    ar_supercell_sim_state: ts.SimState,
+    fe_supercell_sim_state: ts.SimState,
+    lj_model: LennardJonesModel,
+    probed_n_atoms: list[int],
+    *,
+    identical: bool,
+    expected: list[int],
+) -> None:
+    """The in-flight autobatcher takes the limit estimated for the init."""
+    second = ar_supercell_sim_state if identical else fe_supercell_sim_state
+    state = ts.initialize_state(
+        [ar_supercell_sim_state, second], lj_model.device, lj_model.dtype
+    )
+
+    ts.optimize(
+        system=state,
+        model=lj_model,
+        optimizer=ts.Optimizer.fire,
+        max_steps=5,
+        autobatcher=True,
+    )
+
+    assert probed_n_atoms == expected
+
+
+def test_optimize_estimates_the_init_with_the_settings_of_the_autobatcher(
+    ar_supercell_sim_state: ts.SimState,
+    lj_model: LennardJonesModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The limit estimated for the init uses the autobatcher's cutoff and growth."""
+    scale_factors: list[float] = []
+
+    def recording_probe(*_args: Any, scale_factor: float, **_kwargs: Any) -> int:
+        scale_factors.append(scale_factor)
+        return 200
+
+    monkeypatch.setattr(ts.autobatching, "determine_max_batch_size", recording_probe)
+    # First neighbors only (3.7 A), where the default of 6.0 also counts the second
+    cutoff = 4.0
+    autobatcher = InFlightAutoBatcher(
+        model=lj_model,
+        memory_scales_with="n_edges",
+        cutoff=cutoff,
+        memory_scaling_factor=2.0,
+    )
+
+    ts.optimize(
+        system=ar_supercell_sim_state,
+        model=lj_model,
+        optimizer=ts.Optimizer.fire,
+        max_steps=5,
+        autobatcher=autobatcher,
+    )
+
+    metrics = calculate_memory_scalers(ar_supercell_sim_state, "n_edges", cutoff)
+    assert autobatcher.max_memory_scaler == pytest.approx(200 * metrics[0])
+    assert scale_factors == [2.0]
+
+
+def test_in_flight_auto_batcher_counts_lazy_states_at_its_cutoff(
+    ar_supercell_sim_state: ts.SimState,
+    lj_model: LennardJonesModel,
+    probed_n_atoms: list[int],
+) -> None:
+    """The first state of a lazy iterator counts edges at the autobatcher's cutoff."""
+    # First neighbors only (3.7 A), where the default of 6.0 also counts the second
+    cutoff = 4.0
+    batcher = InFlightAutoBatcher(
+        model=lj_model, memory_scales_with="n_edges", cutoff=cutoff
+    )
+
+    batcher.load_states(iter([ar_supercell_sim_state]))
+
+    metrics = calculate_memory_scalers(ar_supercell_sim_state, "n_edges", cutoff)
+    assert probed_n_atoms == [32, 32]
+    assert batcher.max_memory_scaler == pytest.approx(200 * metrics[0])

@@ -12,6 +12,22 @@ if TYPE_CHECKING:
     from torch_sim.optimizers import OptimState
 
 
+def cell_volume(cell: torch.Tensor) -> torch.Tensor:
+    """Volume of one or more cells, positive for left- and right-handed cells.
+
+    ``det(cell)`` is negative for left-handed cells, which would flip the sign of
+    anything derived from it (pressure, barostat forces, scaled cells). Use this
+    helper rather than calling ``torch.det`` on a cell directly.
+
+    Args:
+        cell: Cell matrices with shape ``[..., 3, 3]``.
+
+    Returns:
+        Volumes with shape ``[...]``.
+    """
+    return torch.linalg.det(cell).abs()
+
+
 def _sum_per_system(
     values: torch.Tensor, system_idx: torch.Tensor, n_systems: int | None
 ) -> torch.Tensor:
@@ -26,7 +42,6 @@ def _sum_per_system(
     return sums.scatter_add_(0, system_idx, values)
 
 
-# @torch.jit.script
 def calc_kT(  # noqa: N802
     *,
     masses: torch.Tensor,
@@ -113,7 +128,6 @@ def calc_temperature(
     return kT / units
 
 
-# @torch.jit.script
 def calc_kinetic_energy(
     *,
     masses: torch.Tensor,
@@ -264,14 +278,13 @@ def calc_heat_flux(
     Returns:
         Heat flux vector of shape (3,) or (n_systems, 3)
     """
-    if momenta is not None and velocities is not None:
-        raise ValueError("Must pass either momenta or velocities, not both")
-    if momenta is None and velocities is None:
-        raise ValueError("Must pass either momenta or velocities")
-
     # Deduce velocities
     if velocities is None:
+        if momenta is None:
+            raise ValueError("Must pass either momenta or velocities")
         velocities = momenta / masses.unsqueeze(-1)
+    elif momenta is not None:
+        raise ValueError("Must pass either momenta or velocities, not both")
 
     convective_flux = energies.unsqueeze(-1) * velocities
 

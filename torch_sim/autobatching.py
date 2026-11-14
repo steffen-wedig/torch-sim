@@ -21,7 +21,7 @@ Notes:
 """
 
 import logging
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from itertools import chain
 from typing import Any, get_args
 
@@ -38,9 +38,15 @@ logger = logging.getLogger(__name__)
 
 # Substrings used to recognise out-of-memory errors raised during the memory
 # estimation forward passes. Different backends word this differently: PyTorch
-# raises "CUDA out of memory", while Warp-based neighbor lists (e.g. the
-# nvalchemiops kernels used by ORB v3) raise "Failed to allocate <n> bytes".
-DEFAULT_OOM_ERROR_MESSAGES = ("CUDA out of memory", "Failed to allocate")
+# raises "CUDA out of memory", cuequivariance raises "out of memory", and
+# Warp-based neighbor lists (e.g. the nvalchemiops kernels used by ORB v3) raise
+# "Failed to allocate <n> bytes".
+DEFAULT_OOM_ERROR_MESSAGES = ("out of memory", "Failed to allocate")
+
+# Atoms per neighbor-list pass when computing n_edges scalers. Alchemiops holds
+# fixed-width buffers of ~4.4 KiB per atom at a 6 A cutoff, so this caps the
+# pass at about 1 GiB however large the state is.
+N_EDGES_MAX_ATOMS_PER_CHUNK = 250_000
 
 
 def to_constant_volume_bins(  # noqa: C901
@@ -93,6 +99,8 @@ def to_constant_volume_bins(  # noqa: C901
 
     if not hasattr(items, "__len__"):
         raise TypeError("items must be iterable")
+    if lower_bound is not None and upper_bound is not None and lower_bound >= upper_bound:
+        raise ValueError("lower_bound is greater or equal to upper_bound")
     if len(items) == 0:
         return []
 
@@ -218,14 +226,16 @@ def determine_max_batch_size(
         oom_error_message (str | list[str]): String or list of strings to match in
             RuntimeError messages to identify out-of-memory errors. If any
             listed substring appears in the error, it is treated as OOM.
-            Defaults to ``("CUDA out of memory", "Failed to allocate")``.
+            torch.cuda.OutOfMemoryError is always treated as OOM.
+            Defaults to ``("out of memory", "Failed to allocate")``.
 
     Returns:
         int: Maximum number of batches that fit in GPU memory.
 
     Raises:
-        RuntimeError: If a RuntimeError occurs that doesn't match any of the
-            specified OOM error messages.
+        RuntimeError: If a RuntimeError occurs that is not a
+            torch.cuda.OutOfMemoryError and doesn't match any of the specified
+            OOM error messages.
 
     Example::
 
@@ -263,8 +273,10 @@ def determine_max_batch_size(
                 measure_model_memory_forward(concat_state, model)
             except Exception as exc:
                 exc_str = str(exc)
-                # Check if any of the OOM error messages match
-                if any(msg in exc_str for msg in oom_error_message):
+                # Check the OOM exception type or any of the OOM error messages
+                if isinstance(exc, torch.cuda.OutOfMemoryError) or any(
+                    msg in exc_str for msg in oom_error_message
+                ):
                     safe_size = sizes[max(0, sys_idx - 2)]
                     logger.debug(
                         "OOM at %d systems (%d atoms), returning safe batch size %d",
@@ -290,16 +302,37 @@ def determine_max_batch_size(
             torch.cuda.empty_cache()
 
 
-def _n_edges_scalers(state: SimState, cutoff: float) -> list[float]:
-    """Return per-system edge counts from the neighbor list as memory scalers."""
-    _, system_mapping, _ = torchsim_nl(
-        positions=state.positions,
-        cell=state.cell,
-        pbc=state.pbc,
-        cutoff=cutoff,
-        system_idx=state.system_idx,
-    )
-    return system_mapping.bincount(minlength=state.n_systems).float().tolist()
+def _n_edges_scalers(
+    state: SimState,
+    cutoff: float,
+    max_atoms_per_chunk: int = N_EDGES_MAX_ATOMS_PER_CHUNK,
+) -> list[float]:
+    """Return per-system edge counts from the neighbor list as memory scalers.
+
+    The neighbor list runs over contiguous runs of systems holding at most
+    ``max_atoms_per_chunk`` atoms, so peak memory does not grow with the size of
+    the state. A system larger than the bound runs alone. Edge counts do not
+    depend on other systems, so the result equals a single pass over the state.
+    """
+    n_atoms_per_system = state.n_atoms_per_system.tolist()
+    n_systems = len(n_atoms_per_system)
+    scalers: list[float] = []
+    s0 = a0 = 0
+    while s0 < n_systems:
+        s1, a1 = s0 + 1, a0 + n_atoms_per_system[s0]
+        while s1 < n_systems and a1 - a0 + n_atoms_per_system[s1] <= max_atoms_per_chunk:
+            a1 += n_atoms_per_system[s1]
+            s1 += 1
+        _, system_mapping, _ = torchsim_nl(
+            positions=state.positions[a0:a1],
+            cell=state.cell[s0:s1],
+            pbc=state.pbc,
+            cutoff=cutoff,
+            system_idx=state.system_idx[a0:a1] - s0,
+        )
+        scalers.extend(system_mapping.bincount(minlength=s1 - s0).float().tolist())
+        s0, a0 = s1, a1
+    return scalers
 
 
 def calculate_memory_scalers(
@@ -380,7 +413,7 @@ def calculate_memory_scalers(
                 )
             )
             if system_pbc_all:
-                volume = torch.abs(torch.linalg.det(system_state.cell[0])) / 1000
+                volume = system_state.volume[0] / 1000
             else:
                 bbox = (
                     system_state.positions.max(dim=0).values
@@ -452,8 +485,11 @@ def estimate_max_memory_scaler(
     min_metric = metric_values.min()
     max_metric = metric_values.max()
 
-    min_state = states[int(metric_values.argmin())]
-    max_state = states[int(metric_values.argmax())]
+    min_idx = int(metric_values.argmin())
+    max_idx = int(metric_values.argmax())
+
+    min_state = states[min_idx]
+    max_state = states[max_idx]
 
     print(  # noqa: T201
         "Model Memory Estimation: Estimating memory from worst case of "
@@ -461,9 +497,12 @@ def estimate_max_memory_scaler(
         f"and {max_state.n_systems} batches, and smallest system has "
         f"{min_state.n_atoms} atoms and {min_state.n_systems} batches.",
     )
+
     # determine_max_batch_size releases the caching allocator on its way out, so
     # the device is already handed back before the real optimization run starts.
     min_state_max_batches = determine_max_batch_size(min_state, model, **kwargs)
+    if max_idx == min_idx:
+        return min_state_max_batches * min_metric.item()
     max_state_max_batches = determine_max_batch_size(max_state, model, **kwargs)
 
     return min(
@@ -554,7 +593,7 @@ class BinningAutoBatcher[T: SimState]:
             oom_error_message (str | list[str]): String or list of strings to match in
                 RuntimeError messages to identify out-of-memory errors. If any
                 listed substring appears in the error, it is treated as OOM.
-                Defaults to ``("CUDA out of memory", "Failed to allocate")``.
+                Defaults to ``("out of memory", "Failed to allocate")``.
         """
         self.max_memory_scaler = max_memory_scaler
         self.max_atoms_to_try = max_atoms_to_try
@@ -598,7 +637,7 @@ class BinningAutoBatcher[T: SimState]:
             will be restarted when this method is called.
         """
         batched = (
-            states if isinstance(states, SimState) else ts.concatenate_states(states)
+            ts.concatenate_states(states) if isinstance(states, Sequence) else states
         )
         self.memory_scalers = calculate_memory_scalers(
             batched, self.memory_scales_with, self.cutoff
@@ -633,6 +672,13 @@ class BinningAutoBatcher[T: SimState]:
         # Convert to list of lists of indices
         self.index_bins = [list(batch.keys()) for batch in index_bins]
         self.batched_states = [[batched[index_bin]] for index_bin in self.index_bins]
+        # Later batches get their own seeds, so replicas don't replay one stream
+        parent_rng = torch.Generator(device=batched.device)
+        parent_rng.set_state(batched.rng.get_state())
+        for (bin_state,) in self.batched_states[1:]:
+            bin_state.rng = int(
+                torch.randint(2**62, (1,), generator=parent_rng, device=batched.device)
+            )
         self.current_state_bin = 0
 
         logger.info(
@@ -859,7 +905,7 @@ class InFlightAutoBatcher[T: SimState]:
             oom_error_message (str | list[str]): String or list of strings to match in
                 RuntimeError messages to identify out-of-memory errors. If any
                 listed substring appears in the error, it is treated as OOM.
-                Defaults to ``("CUDA out of memory", "Failed to allocate")``.
+                Defaults to ``("out of memory", "Failed to allocate")``.
         """
         self.model = model
         self.memory_scales_with = memory_scales_with
@@ -904,9 +950,29 @@ class InFlightAutoBatcher[T: SimState]:
             This method resets the current state indices and completed state tracking,
             so any ongoing processing will be restarted when this method is called.
         """
-        if isinstance(states, SimState):
-            states = states.split()
-        self.states_iterator = iter(states)
+        # When all the states are known, estimate the limit over them as
+        # BinningAutoBatcher does, instead of probing the first state to pick the
+        # first batch. Lazy iterators keep that bootstrap probe.
+        if not self.max_memory_scaler and not isinstance(states, Iterator):
+            batched = (
+                states if isinstance(states, SimState) else ts.concatenate_states(states)
+            )
+            metrics = calculate_memory_scalers(
+                batched, self.memory_scales_with, self.cutoff
+            )
+            _max_memory_scaler = estimate_max_memory_scaler(
+                batched,
+                self.model,
+                metrics,
+                max_atoms=self.max_atoms_to_try,
+                scale_factor=self.memory_scaling_factor,
+                oom_error_message=self.oom_error_message,
+            )
+            self.max_memory_scaler = _max_memory_scaler * self.max_memory_padding
+
+        self.states_iterator = iter(
+            states if isinstance(states, Iterable) else states.split()
+        )
 
         self.current_scalers = []
         self.current_idx = []
@@ -990,7 +1056,9 @@ class InFlightAutoBatcher[T: SimState]:
         # we need to sample a state and use it to estimate the max metric
         # for the first batch
         first_state = next(self.states_iterator)
-        first_metric = calculate_memory_scalers(first_state, self.memory_scales_with)[0]
+        first_metric = calculate_memory_scalers(
+            first_state, self.memory_scales_with, self.cutoff
+        )[0]
         self.current_scalers += [first_metric]
         self.current_idx += [0]
         self.iteration_count.append(0)  # Initialize attempt counter for first state
