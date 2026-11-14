@@ -28,6 +28,20 @@ def cell_volume(cell: torch.Tensor) -> torch.Tensor:
     return torch.linalg.det(cell).abs()
 
 
+def _sum_per_system(
+    values: torch.Tensor, system_idx: torch.Tensor, n_systems: int | None
+) -> torch.Tensor:
+    """Sum ``values`` (n_particles,) per system without a host-device sync.
+
+    ``n_systems`` known on the host (e.g. ``state.n_systems``, the cell count) keeps the
+    reduction on the device; without it the count is read back from ``system_idx``.
+    """
+    if n_systems is None:
+        n_systems = int(system_idx.max()) + 1 if system_idx.numel() else 0
+    sums = torch.zeros(n_systems, device=values.device, dtype=values.dtype)
+    return sums.scatter_add_(0, system_idx, values)
+
+
 def calc_kT(  # noqa: N802
     *,
     masses: torch.Tensor,
@@ -69,15 +83,14 @@ def calc_kT(  # noqa: N802
     # Sum squared terms for each system
     flattened_squared = torch.sum(squared_term, dim=-1)
 
-    # Count degrees of freedom per system
-    system_sizes = torch.bincount(system_idx)
+    # The number of systems from dof_per_system when given (no host-device sync)
+    n_systems = None if dof_per_system is None else dof_per_system.shape[0]
+    system_sums = _sum_per_system(flattened_squared, system_idx, n_systems)
     if dof_per_system is None:
+        system_sizes = _sum_per_system(
+            torch.ones_like(flattened_squared), system_idx, system_sums.shape[0]
+        )
         dof_per_system = system_sizes * squared_term.shape[-1]  # multiply by n_dimensions
-
-    # Calculate temperature per system
-    system_sums = flattened_squared.new_zeros(len(system_sizes)).index_add(
-        0, system_idx, flattened_squared
-    )
     return system_sums / dof_per_system
 
 
@@ -121,6 +134,7 @@ def calc_kinetic_energy(
     momenta: torch.Tensor | None = None,
     velocities: torch.Tensor | None = None,
     system_idx: torch.Tensor | None = None,
+    n_systems: int | None = None,
 ) -> torch.Tensor:
     """Computes the kinetic energy of a system.
 
@@ -130,6 +144,8 @@ def calc_kinetic_energy(
         velocities (torch.Tensor | None): Particle velocities, shape (n_particles, n_dim)
         system_idx (torch.Tensor | None): Optional tensor indicating system membership of
         each particle
+        n_systems (int | None): Number of systems; passing it (e.g. ``state.n_systems``)
+        avoids reading it back from ``system_idx`` (a host-device sync)
 
     Returns:
         If system_idx is None: Scalar tensor containing the total kinetic energy
@@ -148,10 +164,7 @@ def calc_kinetic_energy(
     if system_idx is None:
         return 0.5 * torch.sum(squared_term)
     flattened_squared = torch.sum(squared_term, dim=-1)
-    n_systems = int(system_idx.max()) + 1
-    return 0.5 * flattened_squared.new_zeros(n_systems).index_add(
-        0, system_idx, flattened_squared
-    )
+    return 0.5 * _sum_per_system(flattened_squared, system_idx, n_systems)
 
 
 def get_pressure(

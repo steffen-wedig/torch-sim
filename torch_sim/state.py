@@ -435,12 +435,17 @@ class SimState:
 
     @property
     def n_atoms_per_system(self) -> torch.Tensor:
-        """Number of atoms per system."""
-        return self.system_idx.bincount()
+        """Number of atoms per system (counted on the device, no host-device sync)."""
+        counts = torch.zeros(self.n_systems, device=self.device, dtype=torch.int64)
+        return counts.scatter_add_(0, self.system_idx, torch.ones_like(self.system_idx))
 
     @property
     def n_systems(self) -> int:
-        """Number of systems in the system."""
+        """Number of systems in the system.
+
+        The number of cells: ``__post_init__`` checks it equals the number of distinct
+        system indices, and reading it from the cell shape needs no host-device sync.
+        """
         return self.cell.shape[0]
 
     @property
@@ -577,7 +582,10 @@ class SimState:
                 physically valid DOF.
         """
         dof_per_system = _dof_per_system(self, self.constraints)
-        if (dof_per_system <= 0).any():
+        # Without constraints every system has at least one atom (system indices are
+        # validated as consecutive), so 3 or more degrees of freedom: the check, a
+        # host-device sync, is only needed when constraints remove some.
+        if self.constraints and (dof_per_system <= 0).any():
             raise ValueError("Degrees of freedom cannot be zero or negative")
         return dof_per_system
 
